@@ -1,0 +1,65 @@
+import time
+from dataclasses import dataclass
+
+@dataclass
+class MeterReading:
+    voltage_v: float
+    current_a: float
+    power_factor: float
+    start_reading_kwh: float
+    present_reading_kwh: float
+
+class ParasyteBillingEngine:
+    def __init__(self, flat_tariff_inr: float = 7.50, fixed_charge_inr: float = 50.0):
+        self.flat_tariff_inr = flat_tariff_inr
+        self.fixed_charge_inr = fixed_charge_inr
+
+    def calculate_bill(self, reading: MeterReading) -> dict:
+        # 1. Calculate Active Power: P = V * I * PF
+        active_power_w = reading.voltage_v * reading.current_a * reading.power_factor
+
+        # 2. Calculate Units Utilized: Units = Current Reading - Previous Reading
+        units_consumed = max(0.0, reading.present_reading_kwh - reading.start_reading_kwh)
+
+        # 3. Calculate Flat Rate Cost
+        energy_charge = units_consumed * self.flat_tariff_inr
+        total_bill = energy_charge + self.fixed_charge_inr
+
+        return {
+            "voltage_v": round(reading.voltage_v, 2),
+            "current_a": round(reading.current_a, 3),
+            "active_power_w": round(active_power_w, 2),
+            "start_kwh": round(reading.start_reading_kwh, 3),
+            "present_kwh": round(reading.present_reading_kwh, 3),
+            "units_utilized_kwh": round(units_consumed, 3),
+            "energy_charge_inr": round(energy_charge, 2),
+            "fixed_charge_inr": round(self.fixed_charge_inr, 2),
+            "total_payable_inr": round(total_bill, 2),
+        }
+
+if __name__ == "__main__":
+    engine = ParasyteBillingEngine(flat_tariff_inr=7.50, fixed_charge_inr=50.0)
+
+    # Example live data from PARASYTE ESP32 sensor
+    sample_reading = MeterReading(
+        voltage_v=230.5,
+        current_a=5.42,
+        power_factor=0.96,
+        start_reading_kwh=1240.500,  # Meter reading at start of the month
+        present_reading_kwh=1318.850 # Meter reading right now
+    )
+
+    bill = engine.calculate_bill(sample_reading)
+
+    print("================ PARASYTE CONSUMER BILL ================")
+    print(f"Live Current Draw : {bill['current_a']} A @ {bill['voltage_v']} V")
+    print(f"Instantaneous Load: {bill['active_power_w']} W")
+    print("--------------------------------------------------------")
+    print(f"Starting Point    : {bill['start_kwh']} kWh")
+    print(f"Ending Point      : {bill['present_kwh']} kWh")
+    print(f"Units Utilized    : {bill['units_utilized_kwh']} kWh")
+    print("--------------------------------------------------------")
+    print(f"Energy Cost       : ₹{bill['energy_charge_inr']:.2f} (@ ₹7.50/kWh)")
+    print(f"Fixed Grid Charge : ₹{bill['fixed_charge_inr']:.2f}")
+    print(f"TOTAL PAYABLE     : ₹{bill['total_payable_inr']:.2f}")
+    print("========================================================")
