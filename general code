@@ -1,0 +1,164 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <PZEM004Tv30.h>
+#include <Preferences.h> // Stores starting kWh in ESP32 flash memory across power cuts
+
+// 1. Hardware UART2 Pin Definitions
+#define PZEM_RX_PIN 16  // Connected to PZEM TX
+#define PZEM_TX_PIN 17  // Connected to PZEM RX
+#define PZEM_SERIAL Serial2
+
+PZEM004Tv30 pzem(PZEM_SERIAL, PZEM_RX_PIN, PZEM_TX_PIN);
+Preferences preferences;
+
+// 2. Network & Cloud Credentials
+const char* ssid        = "YOUR_WIFI_SSID";
+const char* password    = "YOUR_WIFI_PASSWORD";
+const char* mqtt_server = "broker.hivemq.com";
+const int   mqtt_port   = 1883;
+const char* mqtt_topic  = "parasyte/meter_01/current_usage";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// 3. Billing Variables
+float startMonthKwh = 0.0;        // Starting point reading (Previous Reading)
+const float TARIFF_RATE = 7.50;   // Flat tariff rate in INR (₹7.50 per kWh)
+const float FIXED_CHARGE = 50.00; // Monthly fixed grid maintenance charge (INR)
+
+unsigned long lastReadTime = 0;
+const unsigned long readInterval = 3000; // Poll sensor every 3 seconds
+
+// Optional: Progressive Slab-Based Tariff Calculator (Indian Domestic Standard)
+float calculateSlabBill(float units) {
+  float bill = 0.0;
+  if (units <= 0) return 0.0;
+
+  if (units <= 50) {
+    bill = units * 3.50;
+  } else if (units <= 100) {
+    bill = (50 * 3.50) + ((units - 50) * 4.50);
+  } else if (units <= 200) {
+    bill = (50 * 3.50) + (50 * 4.50) + ((units - 100) * 6.50);
+  } else {
+    bill = (50 * 3.50) + (50 * 4.50) + (100 * 6.50) + ((units - 200) * 7.50);
+  }
+  return bill + FIXED_CHARGE;
+}
+
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println(WiFi.status() == WL_CONNECTED ? "\nWi-Fi Connected!" : "\nOffline Mode Active.");
+}
+
+void reconnectMQTT() {
+  if (WiFi.status() == WL_CONNECTED && !client.connected()) {
+    String clientId = "PARASYTE-Meter-" + String(random(0xffff), HEX);
+    client.connect(clientId.c_str());
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== PARASYTE Smart Meter & Billing Engine ===");
+
+  // Load the saved "Starting Point" reading from non-volatile Flash Memory
+  preferences.begin("parasyte", false);
+  startMonthKwh = preferences.getFloat("start_kwh", -1.0);
+
+  // If running for the very first time, anchor the current PZEM kWh as the starting point
+  float initialEnergy = pzem.energy();
+  if (startMonthKwh < 0.0 && !isnan(initialEnergy)) {
+    startMonthKwh = initialEnergy;
+    preferences.putFloat("start_kwh", startMonthKwh);
+    Serial.printf("Initial Billing Anchor Saved: %.3f kWh\n", startMonthKwh);
+  } else if (startMonthKwh < 0.0) {
+    startMonthKwh = 0.0;
+  }
+
+  setupWiFi();
+  client.setServer(mqtt_server, mqtt_port);
+  Serial.println("Type 'NEW_MONTH' in Serial Monitor to lock in a new billing cycle start point.");
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!client.connected()) reconnectMQTT();
+    client.loop();
+  }
+
+  // Listen for Serial command to start a new monthly billing cycle
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "NEW_MONTH") {
+      float currentReading = pzem.energy();
+      if (!isnan(currentReading)) {
+        startMonthKwh = currentReading;
+        preferences.putFloat("start_kwh", startMonthKwh);
+        Serial.printf("\n[BILLING RESET] New Starting Point anchored at: %.3f kWh\n", startMonthKwh);
+      }
+    }
+  }
+
+  unsigned long now = millis();
+  if (now - lastReadTime >= readInterval) {
+    lastReadTime = now;
+
+    // 1. Read live electrical metrics from PZEM-004T
+    float voltage      = pzem.voltage();   // Volts (V)
+    float current      = pzem.current();   // Amperes (A)
+    float activePower  = pzem.power();     // Watts (W)
+    float presentKwh   = pzem.energy();    // Cumulative Energy (kWh)
+    float frequency    = pzem.frequency(); // Hertz (Hz)
+    float powerFactor  = pzem.pf();        // Power Factor
+
+    if (isnan(voltage) || isnan(current) || isnan(presentKwh)) {
+      Serial.println("[SENSOR ERROR] Unable to read PZEM-004T. Check AC mains & RX/TX pins.");
+      return;
+    }
+
+    // 2. Core PARASYTE Billing Calculation:
+    // Units Utilized = Present Reading (Ending Point) - Starting Point Reading
+    float unitsConsumed = presentKwh - startMonthKwh;
+    if (unitsConsumed < 0) unitsConsumed = 0.0;
+
+    // 3. Calculate Consumer Price (Flat Tariff & Slab Tariff)
+    float flatBillPrice = unitsConsumed * TARIFF_RATE;
+    float slabBillPrice = calculateSlabBill(unitsConsumed);
+
+    // 4. Display Live Consumer Receipt on Serial Monitor
+    Serial.println("\n================ PARASYTE LIVE METER ================");
+    Serial.printf("Voltage:           %.2f V   | Current:      %.3f A\n", voltage, current);
+    Serial.printf("Active Power:      %.2f W   | Power Factor: %.2f\n", activePower, powerFactor);
+    Serial.println("-----------------------------------------------------");
+    Serial.printf("Starting Reading:  %.3f kWh (Previous Cycle Point)\n", startMonthKwh);
+    Serial.printf("Present Reading:   %.3f kWh (Current Point)\n", presentKwh);
+    Serial.printf("Units Utilized:    %.3f kWh (Units = Present - Start)\n", unitsConsumed);
+    Serial.println("-----------------------------------------------------");
+    Serial.printf("Flat Rate Bill (@ ₹%.2f/unit): ₹%.2f\n", TARIFF_RATE, flatBillPrice);
+    Serial.printf("Tiered Slab Bill (+Fixed):     ₹%.2f\n", slabBillPrice);
+    Serial.println("=====================================================");
+
+    // 5. Publish JSON payload to Cloud/Mobile App
+    char jsonPayload[320];
+    snprintf(jsonPayload, sizeof(jsonPayload),
+             "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.2f,"
+             "\"start_month_kwh\":%.3f,\"current_kwh\":%.3f,"
+             "\"units_consumed\":%.3f,\"flat_bill_inr\":%.2f,\"slab_bill_inr\":%.2f}",
+             voltage, current, activePower, startMonthKwh, presentKwh,
+             unitsConsumed, flatBillPrice, slabBillPrice);
+
+    if (client.connected()) {
+      client.publish(mqtt_topic, jsonPayload);
+    }
+  }
+}
