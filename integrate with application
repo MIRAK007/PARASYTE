@@ -1,0 +1,470 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
+
+void main() {
+  runApp(const ParasyteMobileApp());
+}
+
+class ParasyteMobileApp extends StatelessWidget {
+  const ParasyteMobileApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'PARASYTE Smart Meter',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0B1120),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF00F5D4),
+          secondary: Color(0xFFFF9F1C),
+          surface: Color(0xFF1E293B),
+        ),
+      ),
+      home: const ParasyteDashboard(),
+    );
+  }
+}
+
+class ParasyteDashboard extends StatefulWidget {
+  const ParasyteDashboard({super.key});
+
+  @override
+  State<ParasyteDashboard> createState() => _ParasyteDashboardState();
+}
+
+class _ParasyteDashboardState extends State<ParasyteDashboard> {
+  // MQTT Configuration (Matches ESP32 Firmware)
+  final String mqttBroker = 'broker.hivemq.com';
+  final String mqttTopic = 'parasyte/meter_01/current_usage';
+  MqttServerClient? client;
+
+  bool isMqttConnected = false;
+  bool isSimulationMode = false; // Toggle for hackathon demo without AC mains
+  bool useSlabTariff = false;    // Toggle between Flat Rate and Slab Rate
+  Timer? simTimer;
+
+  // Live Electrical Telemetry from ESP32 + PZEM-004T
+  double voltage = 230.0;
+  double currentAmps = 0.0;
+  double activePowerWatts = 0.0;
+  double powerFactor = 0.96;
+  double startMonthKwh = 1240.000;
+  double currentKwh = 1295.400;
+
+  // Billing Constants
+  double flatTariffRate = 7.50; // ₹7.50 per kWh
+  final double fixedGridCharge = 50.00; // ₹50 monthly fixed charge
+
+  @override
+  void initState() {
+    super.initState();
+    _connectToEsp32Mqtt();
+  }
+
+  @override
+  void dispose() {
+    simTimer?.cancel();
+    client?.disconnect();
+    super.dispose();
+  }
+
+  // 1. Connect to ESP32 via MQTT Broker
+  Future<void> _connectToEsp32Mqtt() async {
+    final String clientId = 'PARASYTE_App_${Random().nextInt(99999)}';
+    client = MqttServerClient(mqttBroker, clientId);
+    client!.port = 1883;
+    client!.keepAlivePeriod = 20;
+    client!.onDisconnected = () {
+      if (mounted) setState(() => isMqttConnected = false);
+    };
+
+    final connMess = MqttConnectMessage()
+        .withClientIdentifier(clientId)
+        .startClean()
+        .withWillQos(MqttQos.atLeastOnce);
+    client!.connectionMessage = connMess;
+
+    try {
+      await client!.connect();
+    } catch (e) {
+      client!.disconnect();
+    }
+
+    if (client!.connectionStatus!.state == MqttConnectionState.connected) {
+      setState(() => isMqttConnected = true);
+      client!.subscribe(mqttTopic, MqttQos.atMostOnce);
+
+      // Listen to incoming JSON payloads from ESP32
+      client!.updates!.listen((List<MqttReceivedMessage<MqttMessage?>>? c) {
+        if (c == null || c.isEmpty || isSimulationMode) return;
+        final MqttPublishMessage recMess = c[0].payload as MqttPublishMessage;
+        final String payload =
+            MqttPublishPayload.bytesToStringAsString(recMess.payload.message);
+
+        _parseEsp32Payload(payload);
+      });
+    } else {
+      setState(() => isMqttConnected = false);
+    }
+  }
+
+  // 2. Parse JSON Sent by ESP32
+  void _parseEsp32Payload(String jsonString) {
+    try {
+      final Map<String, dynamic> data = jsonDecode(jsonString);
+      setState(() {
+        voltage = (data['voltage'] ?? voltage).toDouble();
+        currentAmps = (data['current'] ?? currentAmps).toDouble();
+        activePowerWatts = (data['power'] ?? activePowerWatts).toDouble();
+        startMonthKwh = (data['start_month_kwh'] ?? startMonthKwh).toDouble();
+        currentKwh = (data['current_kwh'] ?? currentKwh).toDouble();
+      });
+    } catch (e) {
+      debugPrint('Error parsing ESP32 JSON: $e');
+    }
+  }
+
+  // 3. Built-in Simulator (For Live Demo to Judges if Hardware is Unplugged)
+  void _toggleSimulation(bool enable) {
+    setState(() => isSimulationMode = enable);
+    simTimer?.cancel();
+    if (enable) {
+      simTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+        setState(() {
+          voltage = 229.0 + Random().nextDouble() * 4.0;
+          currentAmps = 4.20 + Random().nextDouble() * 1.5;
+          activePowerWatts = voltage * currentAmps * powerFactor;
+          currentKwh += (activePowerWatts / 1000.0) * 0.005; // Tick up kWh
+        });
+      });
+    }
+  }
+
+  // 4. Core PARASYTE Billing Calculations
+  double get unitsConsumed => max(0.0, currentKwh - startMonthKwh);
+
+  double get calculatedBill {
+    if (!useSlabTariff) {
+      return (unitsConsumed * flatTariffRate) + fixedGridCharge;
+    }
+    // Progressive Indian Domestic Slab Calculation
+    double u = unitsConsumed;
+    double bill = 0.0;
+    if (u <= 50) {
+      bill = u * 3.50;
+    } else if (u <= 100) {
+      bill = (50 * 3.50) + ((u - 50) * 4.50);
+    } else if (u <= 200) {
+      bill = (50 * 3.50) + (50 * 4.50) + ((u - 100) * 6.50);
+    } else {
+      bill = (50 * 3.50) + (50 * 4.50) + (100 * 6.50) + ((u - 200) * 7.50);
+    }
+    return bill + fixedGridCharge;
+  }
+
+  // 5. One-Tap Payment Checkout Modal
+  void _showPaymentSheet() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1E293B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) {
+        return Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text(
+                'PARASYTE INSTANT CHECKOUT',
+                style: TextStyle(
+                  color: Color(0xFF00F5D4),
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              const SizedBox(height: 16),
+              Text(
+                'Total Payable: ₹${calculatedBill.toStringAsFixed(2)}',
+                style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'For ${unitsConsumed.toStringAsFixed(3)} kWh consumed this cycle (includes ₹${fixedGridCharge.toStringAsFixed(0)} fixed grid charge).',
+                style: const TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00F5D4),
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                ),
+                onPressed: () {
+                  setState(() {
+                    // Anchor current reading as the new baseline after payment
+                    startMonthKwh = currentKwh;
+                  });
+                  Navigator.pop(context);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('Payment Successful! Billing anchor reset to 0.00 kWh.'),
+                      backgroundColor: Colors.green,
+                    ),
+                  );
+                },
+                icon: const Icon(Icons.verified_user),
+                label: const Text(
+                  'CONFIRM & PAY VIA UPI / RAZORPAY',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1E293B),
+        elevation: 0,
+        title: Row(
+          children: [
+            const Icon(Icons.bolt, color: Color(0xFF00F5D4)),
+            const SizedBox(width: 8),
+            const Text(
+              'PARASYTE',
+              style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.5),
+            ),
+            const Spacer(),
+            // Connection Badge
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: (isMqttConnected || isSimulationMode)
+                    ? Colors.green.withOpacity(0.2)
+                    : Colors.red.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: (isMqttConnected || isSimulationMode)
+                      ? Colors.greenAccent
+                      : Colors.redAccent,
+                ),
+              ),
+              child: Text(
+                isSimulationMode
+                    ? 'SIMULATOR LIVE'
+                    : (isMqttConnected ? 'ESP32 ONLINE' : 'BLE FALLBACK'),
+                style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Demo Simulator Toggle Bar
+            SwitchListTile(
+              tileColor: const Color(0xFF1E293B),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              title: const Text('Live Hardware / Demo Simulator',
+                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+              subtitle: Text(
+                isSimulationMode
+                    ? 'Simulating live AC current load for demo'
+                    : 'Listening to ESP32 MQTT topic ($mqttTopic)',
+                style: const TextStyle(fontSize: 12, color: Colors.white60),
+              ),
+              activeColor: const Color(0xFF00F5D4),
+              value: isSimulationMode,
+              onChanged: _toggleSimulation,
+            ),
+            const SizedBox(height: 16),
+
+            // Live Current & Telemetry Hero Card
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  colors: [Color(0xFF1E293B), Color(0xFF0F172A)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: Column(
+                children: [
+                  const Text(
+                    'REAL-TIME ELECTRIC CURRENT',
+                    style: TextStyle(
+                      color: Color(0xFF00F5D4),
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.4,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    '${currentAmps.toStringAsFixed(3)} A',
+                    style: const TextStyle(
+                      fontSize: 48,
+                      fontWeight: FontWeight.w900,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _metricTile('VOLTAGE', '${voltage.toStringAsFixed(1)} V'),
+                      _metricTile('ACTIVE POWER', '${activePowerWatts.toStringAsFixed(1)} W'),
+                      _metricTile('POWER FACTOR', powerFactor.toStringAsFixed(2)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Dynamic Billing Engine Card
+            Container(
+              padding: const EdgeInsets.all(20),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1E293B),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'CONSUMER BILLING ENGINE',
+                        style: TextStyle(
+                          color: Color(0xFFFF9F1C),
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.3,
+                        ),
+                      ),
+                      Row(
+                        children: [
+                          const Text('Slab Rate', style: TextStyle(fontSize: 12)),
+                          Switch(
+                            value: useSlabTariff,
+                            activeColor: const Color(0xFFFF9F1C),
+                            onChanged: (val) => setState(() => useSlabTariff = val),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const Divider(color: Colors.white12, height: 20),
+                  _billingRow('Starting Reading (1st of Month):',
+                      '${startMonthKwh.toStringAsFixed(3)} kWh'),
+                  const SizedBox(height: 8),
+                  _billingRow('Present Live Meter Reading:',
+                      '${currentKwh.toStringAsFixed(3)} kWh'),
+                  const SizedBox(height: 8),
+                  _billingRow(
+                    'Net Units Utilized:',
+                    '${unitsConsumed.toStringAsFixed(3)} kWh',
+                    isBold: true,
+                  ),
+                  const SizedBox(height: 8),
+                  _billingRow(
+                    'Tariff Mode:',
+                    useSlabTariff
+                        ? 'Tiered Domestic Slabs + ₹50 Fixed'
+                        : 'Flat ₹${flatTariffRate.toStringAsFixed(2)}/kWh + ₹50 Fixed',
+                  ),
+                  const Divider(color: Colors.white12, height: 28),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text(
+                        'LIVE PAYABLE BILL',
+                        style: TextStyle(fontSize: 14, color: Colors.white70),
+                      ),
+                      Text(
+                        '₹${calculatedBill.toStringAsFixed(2)}',
+                        style: const TextStyle(
+                          fontSize: 34,
+                          fontWeight: FontWeight.w900,
+                          color: Color(0xFF00F5D4),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+
+            // One-Tap Payment Button
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFFFF9F1C),
+                foregroundColor: Colors.black,
+                padding: const EdgeInsets.symmetric(vertical: 18),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              onPressed: _showPaymentSheet,
+              icon: const Icon(Icons.payment),
+              label: Text(
+                'SETTLE BILL NOW (₹${calculatedBill.toStringAsFixed(2)})',
+                style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _metricTile(String label, String value) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(fontSize: 10, color: Colors.white54)),
+        const SizedBox(height: 4),
+        Text(value, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+      ],
+    );
+  }
+
+  Widget _billingRow(String label, String value, {bool isBold = false}) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white70, fontSize: 13)),
+        Text(
+          value,
+          style: TextStyle(
+            color: isBold ? const Color(0xFF00F5D4) : Colors.white,
+            fontWeight: isBold ? FontWeight.bold : FontWeight.w500,
+            fontSize: 14,
+          ),
+        ),
+      ],
+    );
+  }
+}
